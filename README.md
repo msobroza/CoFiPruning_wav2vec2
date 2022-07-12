@@ -54,7 +54,7 @@ Our released models are listed as following. You can download these models with 
 
 You can use these models with the huggingface interface:
 ```python
-from CoFiPruning.models import CoFiBertForSequenceClassification
+from models.modeling_bert import CoFiBertForSequenceClassification import CoFiBertForSequenceClassification
 model = CoFiBertForSequenceClassification.from_pretrained("princeton-nlp/CoFi-MNLI-s95") 
 output = model(**inputs)
 ```
@@ -102,7 +102,7 @@ An example for training (pruning) is as follows:
 TASK=MNLI
 SUFFIX=sparsity0.95
 EX_CATE=CoFi
-PRUNING_TYPE=structured_head+structured_mlp+hidden+layer
+PRUNING_TYPE=structured_heads+structured_mlp+hidden+layer
 SPARSITY=0.95
 DISTILL_LAYER_LOSS_ALPHA=0.9
 DISTILL_CE_LOSS_ALPHA=0.1
