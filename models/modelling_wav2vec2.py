@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
-
+from torch import nn
 from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2ForPreTrainingOutput
 
 from transformers import AutoConfig, Wav2Vec2Config
@@ -21,12 +21,9 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (Wav2Vec2ForCTC,
                                                             _HIDDEN_STATES_START_POSITION,
                                                             Wav2Vec2FeatureEncoder,
                                                             Wav2Vec2FeatureProjection,
-                                                            
+                                                            Wav2Vec2Adapter                                                           
                                                            )
 
-
-import torch
-from torch import nn
 from transformers.modeling_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
 import logging
 from models.modeling_bert import CoFiLayerNorm 
@@ -42,15 +39,17 @@ class CoFiWav2Vec2FeatureProjection(nn.Module):
         self.projection = nn.Linear(config.conv_dim[-1], config.hidden_size)
         self.dropout = nn.Dropout(config.feat_proj_dropout)
 
-    def forward(self, hidden_states, mlp_z, hidden_z=None, inference=False):
+    def forward(self, hidden_states, feature_mlp_z, feature_hidden_z=None, inference=False):
         # non-projected hidden states are needed for quantization
+        if feature_mlp_z is not None:
+            hidden_states *= feature_mlp_z
         if not inference and hidden_states.sum().eq(0).item():
            norm_hidden_states = hidden_states
         else:
-            if hidden_z is not None:
-                hidden_states = hidden_states.mult(hidden_z)
-            norm_hidden_states = self.layer_norm(hidden_states, hidden_z)
-            if hidden_z is not None:
+            if feature_hidden_z is not None:
+                hidden_states = hidden_states.mult(feature_hidden_z)
+            norm_hidden_states = self.layer_norm(hidden_states, feature_hidden_z)
+            if feature_hidden_z is not None:
                 norm_hidden_states = norm_hidden_states.mul(norm_hidden_states)
         hidden_states = self.projection(norm_hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -66,7 +65,7 @@ class CoFiWav2Vec2Model(Wav2Vec2Model):
             self.encoder = CoFiWav2Vec2EncoderStableLayerNorm(config)
         else:
             self.encoder = CoFiWav2Vec2Encoder(config)
-        self.adapter = CoFiWav2Vec2Adapter(config) if config.add_adapter else None
+        self.adapter = Wav2Vec2Adapter(config) if config.add_adapter else None
         self.post_init()
     
     def forward(
@@ -77,6 +76,11 @@ class CoFiWav2Vec2Model(Wav2Vec2Model):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        feature_mlp_z=None,
+        feature_hidden_z=None,
+        intermediate_z=None,
+        mlp_z=None,
+        hidden_z=None
     ) -> Union[Tuple, Wav2Vec2BaseModelOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -84,7 +88,7 @@ class CoFiWav2Vec2Model(Wav2Vec2Model):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        extract_features = self.feature_extractor(input_values)
+        extract_features = self.feature_extractor(input_values, feature_mlp_z)
         extract_features = extract_features.transpose(1, 2)
 
         if attention_mask is not None:
