@@ -12,7 +12,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2ForPreTrainingOutput
+from transformers.models.wav2vec2.modeling_wav2vec2 import (Wav2Vec2ForPreTrainingOutput,
+                                                            Wav2Vec2EncoderLayerStableLayerNorm)
 
 from transformers import AutoConfig, Wav2Vec2Config
 from transformers.modeling_outputs import CausalLMOutput, Wav2Vec2BaseModelOutput
@@ -26,34 +27,13 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (Wav2Vec2ForCTC,
                                                             Wav2Vec2EncoderStableLayerNorm                                                        
                                                            )
 
+from transformers.activations import ACT2FN
+from transformers.deepspeed import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
 import logging
 from models.modeling_bert import CoFiLayerNorm 
 
 logger = logging.getLogger(__name__)
-
-class CoFiWav2Vec2FeatureProjection(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.layer_norm = CoFiLayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
-        self.projection = nn.Linear(config.conv_dim[-1], config.hidden_size)
-        self.dropout = nn.Dropout(config.feat_proj_dropout)
-
-    def forward(self, hidden_states, feature_mlp_z, feature_hidden_z=None, inference=False):
-        # non-projected hidden states are needed for quantization
-        if feature_mlp_z is not None:
-            hidden_states *= feature_mlp_z
-        if not inference and hidden_states.sum().eq(0).item():
-           norm_hidden_states = hidden_states
-        else:
-            if feature_hidden_z is not None:
-                hidden_states = hidden_states.mult(feature_hidden_z)
-            norm_hidden_states = self.layer_norm(hidden_states, feature_hidden_z)
-            if feature_hidden_z is not None:
-                norm_hidden_states = norm_hidden_states.mul(norm_hidden_states)
-        hidden_states = self.projection(norm_hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states, norm_hidden_states
 
 class CoFiWav2Vec2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -96,8 +76,7 @@ class CoFiWav2Vec2Attention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        head_z=None,
-        head_layer_z=None,
+        head_z=None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -183,7 +162,7 @@ class CoFiWav2Vec2Attention(nn.Module):
             attn_weights_reshaped = None
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-
+        # This mask was added in order to apply cofi on attention layers
         attn_output = torch.bmm(attn_probs, value_states)
         if head_z is not None:
             attn_output *= head_z
@@ -204,7 +183,7 @@ class CoFiWav2Vec2Attention(nn.Module):
 
         return attn_output, attn_weights_reshaped, past_key_value
 
-class Wav2Vec2FeedForward(nn.Module):
+class CoFiWav2Vec2FeedForward(Wav2Vec2FeedForward):
     def __init__(self, config):
         super().__init__()
         self.intermediate_dropout = nn.Dropout(config.activation_dropout)
@@ -218,7 +197,10 @@ class Wav2Vec2FeedForward(nn.Module):
         self.output_dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.output_dropout = nn.Dropout(config.hidden_dropout)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states,
+                intermediate_z=None,
+                mlp_z=None,
+                hidden_z=None):
         hidden_states = self.intermediate_dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         hidden_states = self.intermediate_dropout(hidden_states)
@@ -238,19 +220,32 @@ class CoFiWav2Vec2EncoderLayerStableLayerNorm(Wav2Vec2EncoderLayerStableLayerNor
             is_decoder=False,
         )
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.feed_forward = CoFiWav2Vec2FeedForward(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_layer_norm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, hidden_states, attention_mask=None, output_attentions=False):
+    def forward(self,
+                hidden_states,
+                attention_mask=None,
+                output_attentions=False,
+                head_layer_z=None,
+                head_z=None,
+                intermediate_z=None,
+                mlp_z=None,
+                hidden_z=None):
         attn_residual = hidden_states
         hidden_states = self.layer_norm(hidden_states)
         hidden_states, attn_weights, _ = self.attention(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
-        )
+            hidden_states, attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            head_z=head_z)
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
-        hidden_states = hidden_states + self.feed_forward(self.final_layer_norm(hidden_states))
+        hidden_states = hidden_states + self.feed_forward(self.final_layer_norm(hidden_states),
+                                                          intermediate_z=intermediate_z,
+                                                          mlp_z=mlp_z,
+                                                          hidden_z=hidden_z
+                                                          )
 
         outputs = (hidden_states,)
 
@@ -278,6 +273,12 @@ class CoFiWav2Vec2EncoderStableLayerNorm(Wav2Vec2EncoderStableLayerNorm):
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
+        head_layer_z=None,
+        head_z=None,
+        intermediate_z=None,
+        mlp_z=None,
+        hidden_z=None
+        
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -300,7 +301,7 @@ class CoFiWav2Vec2EncoderStableLayerNorm(Wav2Vec2EncoderStableLayerNorm):
 
         deepspeed_zero3_is_enabled = is_deepspeed_zero3_enabled()
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -320,13 +321,23 @@ class CoFiWav2Vec2EncoderStableLayerNorm(Wav2Vec2EncoderStableLayerNorm):
                         return custom_forward
 
                     layer_outputs = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(layer),
+                        create_custom_forward(layer[i]),
                         hidden_states,
                         attention_mask,
+                        head_layer_z=head_layer_z[i],
+                        head_z=head_z[i],
+                        intermediate_z=intermediate_z[i],
+                        mlp_z=mlp_z[i],
+                        hidden_z=hidden_z[i]
                     )
                 else:
                     layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions,
+                        hhead_layer_z=head_layer_z[i],
+                        head_z=head_z[i],
+                        intermediate_z=intermediate_z[i],
+                        mlp_z=mlp_z[i],
+                        hidden_z=hidden_z[i]
                     )
                 hidden_states = layer_outputs[0]
 
@@ -353,7 +364,7 @@ class CoFiWav2Vec2Model(Wav2Vec2Model):
     def __init__(self, config):
         super().__init__(config)
         self.feature_extractor = Wav2Vec2FeatureEncoder(config)
-        self.feature_projection = CoFiWav2Vec2FeatureProjection(config)
+        self.feature_projection = Wav2Vec2FeatureProjection(config)
         if config.do_stable_layer_norm:
             self.encoder = CoFiWav2Vec2EncoderStableLayerNorm(config)
         else:
@@ -403,6 +414,11 @@ class CoFiWav2Vec2Model(Wav2Vec2Model):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            head_z=head_z,
+            head_layer_z=head_layer_z,
+            intermediate_z=intermediate_z,
+            mlp_z=mlp_z,
+            hidden_z=hidden_z
         )
 
         hidden_states = encoder_outputs[0]
@@ -441,14 +457,12 @@ class CoFiWav2Vec2ForCTC(Wav2Vec2ForCTC):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         labels: Optional[torch.Tensor] = None,
+        intermediate_z: Optional[torch.Tensor] = None,
+        head_z: Optional[torch.Tensor] = None,
+        mlp_z: Optional[torch.Tensor] = None,
+        head_layer_z: Optional[torch.Tensor] = None,
+        hidden_z: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, target_length)`, *optional*):
-            Labels for connectionist temporal classification. Note that `target_length` has to be smaller or equal to
-            the sequence length of the output logits. Indices are selected in `[-100, 0, ..., config.vocab_size - 1]`.
-            All labels set to `-100` are ignored (masked), the loss is only computed for labels in `[0, ...,
-            config.vocab_size - 1]`.
-        """
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -458,6 +472,11 @@ class CoFiWav2Vec2ForCTC(Wav2Vec2ForCTC):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            intermediate_z=intermediate_z,
+            head_z=head_z,
+            mlp_z=mlp_z,
+            head_layer_z=head_layer_z,
+            hidden_z=hidden_z,
         )
 
         hidden_states = outputs[0]
