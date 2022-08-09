@@ -16,15 +16,19 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (Wav2Vec2ForPreTraini
                                                             Wav2Vec2EncoderLayerStableLayerNorm)
 
 from transformers import AutoConfig, Wav2Vec2Config
-from transformers.modeling_outputs import CausalLMOutput, Wav2Vec2BaseModelOutput
+from transformers.modeling_outputs import CausalLMOutput, Wav2Vec2BaseModelOutput, BaseModelOutput
 from transformers.models.wav2vec2.modeling_wav2vec2 import (Wav2Vec2ForCTC,
                                                             Wav2Vec2Model,
                                                             _HIDDEN_STATES_START_POSITION,
                                                             Wav2Vec2FeatureEncoder,
                                                             Wav2Vec2FeatureProjection,
                                                             Wav2Vec2Adapter,
+                                                            Wav2Vec2FeedForward,
+                                                            Wav2Vec2EncoderLayer,
                                                             Wav2Vec2PositionalConvEmbedding,
-                                                            Wav2Vec2EncoderStableLayerNorm                                                        
+                                                            Wav2Vec2EncoderStableLayerNorm,
+                                                            Wav2Vec2Encoder,
+                                                            Wav2Vec2Attention                                                        
                                                            )
 
 from transformers.activations import ACT2FN
@@ -35,7 +39,7 @@ from models.modeling_bert import CoFiLayerNorm
 
 logger = logging.getLogger(__name__)
 
-class CoFiWav2Vec2Attention(nn.Module):
+class CoFiWav2Vec2Attention(Wav2Vec2Attention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
@@ -202,13 +206,65 @@ class CoFiWav2Vec2FeedForward(Wav2Vec2FeedForward):
                 mlp_z=None,
                 hidden_z=None):
         hidden_states = self.intermediate_dense(hidden_states)
+        if intermediate_z is not None:
+            hidden_states = hidden_states.mul(hidden_z)
         hidden_states = self.intermediate_act_fn(hidden_states)
         hidden_states = self.intermediate_dropout(hidden_states)
-
+        if hidden_z is not None:
+            hidden_states = hidden_states.mul(hidden_z)
         hidden_states = self.output_dense(hidden_states)
+        if mlp_z is not None:
+            hidden_states *= mlp_z
         hidden_states = self.output_dropout(hidden_states)
+        if mlp_z is not None:
+            hidden_states *= mlp_z
+        if hidden_z is not None:
+            hidden_states = hidden_states.mul(hidden_z)
         return hidden_states
 
+class CoFiWav2Vec2EncoderLayer(Wav2Vec2EncoderLayer):
+    def __init__(self, config):
+        super().__init__()
+        self.attention = CoFiWav2Vec2Attention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=False,
+        )
+        self.dropout = nn.Dropout(config.hidden_dropout)
+        self.layer_norm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.feed_forward = CoFiWav2Vec2FeedForward(config)
+        self.final_layer_norm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states,
+                attention_mask=None,
+                output_attentions=False,
+                head_layer_z=None,
+                head_z=None,
+                intermediate_z=None,
+                mlp_z=None,
+                hidden_z=None):
+        attn_residual = hidden_states
+        hidden_states, attn_weights, _ = self.attention(
+            hidden_states, attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            head_z=head_z)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = attn_residual + hidden_states
+
+        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = hidden_states + self.feed_forward(hidden_states,
+                                                          intermediate_z=intermediate_z,
+                                                          mlp_z=mlp_z,
+                                                          hidden_z=hidden_z)
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs
 
 class CoFiWav2Vec2EncoderLayerStableLayerNorm(Wav2Vec2EncoderLayerStableLayerNorm):
     def __init__(self, config):
@@ -253,6 +309,103 @@ class CoFiWav2Vec2EncoderLayerStableLayerNorm(Wav2Vec2EncoderLayerStableLayerNor
             outputs += (attn_weights,)
 
         return outputs
+
+class CoFiWav2Vec2Encoder(Wav2Vec2Encoder):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.pos_conv_embed = Wav2Vec2PositionalConvEmbedding(config)
+        self.layer_norm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout)
+        self.layers = nn.ModuleList([CoFiWav2Vec2EncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.gradient_checkpointing = False
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        head_layer_z=None,
+        head_z=None,
+        intermediate_z=None,
+        mlp_z=None,
+        hidden_z=None
+    ):
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+
+        if attention_mask is not None:
+            # make sure padded tokens output 0
+            expand_attention_mask = attention_mask.unsqueeze(-1).repeat(1, 1, hidden_states.shape[2])
+            hidden_states[~expand_attention_mask] = 0
+
+            # extend attention_mask
+            attention_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
+            attention_mask = attention_mask * torch.finfo(hidden_states.dtype).min
+            attention_mask = attention_mask.expand(
+                attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
+            )
+
+        position_embeddings = self.pos_conv_embed(hidden_states)
+        hidden_states = hidden_states + position_embeddings
+        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        deepspeed_zero3_is_enabled = is_deepspeed_zero3_enabled()
+
+        for i, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            dropout_probability = np.random.uniform(0, 1)
+
+            skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
+            if not skip_the_layer or deepspeed_zero3_is_enabled:
+                # under deepspeed zero3 all gpus must run in sync
+                if self.gradient_checkpointing and self.training:
+                    # create gradient checkpointing function
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs, output_attentions)
+
+                        return custom_forward
+
+                    
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(layer[i]),
+                        hidden_states,
+                        attention_mask,
+                        head_layer_z=head_layer_z[i] if head_layer_z else None,
+                        head_z=head_z[i] if head_z else None,
+                        intermediate_z=intermediate_z[i] if intermediate_z else None,
+                        mlp_z=mlp_z[i] if mlp_z else None,
+                        hidden_z=hidden_z[i] if hidden_z else None
+                    )
+                else:
+                    layer_outputs = layer(
+                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+                    )
+                hidden_states = layer_outputs[0]
+
+            if skip_the_layer:
+                layer_outputs = (None, None)
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
 
 class CoFiWav2Vec2EncoderStableLayerNorm(Wav2Vec2EncoderStableLayerNorm):
     def __init__(self, config):
@@ -324,20 +477,20 @@ class CoFiWav2Vec2EncoderStableLayerNorm(Wav2Vec2EncoderStableLayerNorm):
                         create_custom_forward(layer[i]),
                         hidden_states,
                         attention_mask,
-                        head_layer_z=head_layer_z[i],
-                        head_z=head_z[i],
-                        intermediate_z=intermediate_z[i],
-                        mlp_z=mlp_z[i],
-                        hidden_z=hidden_z[i]
+                        head_layer_z=head_layer_z[i] if head_layer_z else None,
+                        head_z=head_z[i] if head_z else None,
+                        intermediate_z=intermediate_z[i] if intermediate_z else None,
+                        mlp_z=mlp_z[i] if mlp_z else None,
+                        hidden_z=hidden_z[i] if hidden_z else None
                     )
                 else:
                     layer_outputs = layer(
                         hidden_states, attention_mask=attention_mask, output_attentions=output_attentions,
-                        hhead_layer_z=head_layer_z[i],
-                        head_z=head_z[i],
-                        intermediate_z=intermediate_z[i],
-                        mlp_z=mlp_z[i],
-                        hidden_z=hidden_z[i]
+                        head_layer_z=head_layer_z[i] if head_layer_z else None,
+                        head_z=head_z[i] if head_z else None,
+                        intermediate_z=intermediate_z[i] if intermediate_z else None,
+                        mlp_z=mlp_z[i] if mlp_z else None,
+                        hidden_z=hidden_z[i] if hidden_z else None
                     )
                 hidden_states = layer_outputs[0]
 
