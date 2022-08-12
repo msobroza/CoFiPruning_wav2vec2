@@ -49,7 +49,7 @@ class CoFIWav2Vec2ForCTCTrainer(CoFiTrainer):
         metrics["global_step"] = self.global_step
 
         self.logger.info(f"Evaluationg: {metrics}")
-        name = "f1"
+        name = "wer"
         eval_score = metrics[name]
 
         if self.save_saving_best:

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
+import numpy as np
 from torch import nn
 from transformers.models.wav2vec2.modeling_wav2vec2 import (Wav2Vec2ForPreTrainingOutput,
                                                             Wav2Vec2EncoderLayerStableLayerNorm)
